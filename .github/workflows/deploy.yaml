@@ -1,0 +1,50 @@
+name: Production CD - Deploy to Amazon EKS
+
+# 🎯 實現你的設計：只有當代碼正式「合併/推入」到 main 主幹時，才觸發部署
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy-to-prd:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 1. 拉取最新的原始碼
+      uses: actions/checkout@v4
+
+    - name: 2. 設定 AWS 鑰匙（調用你剛才設定的 Secrets）
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-southeast-1
+
+    - name: 3. 登入 AWS ECR 倉庫
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: 4. 編編並推送 Docker 映像檔 (引入動態 Commit SHA 標籤)
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: gamania-nginx
+        # 💡 SRE 最佳實踐：不用固定的 :v1，改用 GitHub 獨一無二的 Commit ID 當標籤，防止版本覆蓋
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        # 把動態產生的完整映像檔網址存進環境變數，方便下一步使用
+        echo "FULL_IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+    - name: 5. 更新本地的 Kubeconfig 憑證以連接 EKS
+      run: |
+        aws eks update-kubeconfig --name gamania-sre-cluster --region ap-southeast-1
+
+    - name: 6. 動態修改 K8s 藍圖並發射部署 (CD)
+      run: |
+        # 💡 SRE 祕技：用 sed 指令，自動把 deployment.yaml 裡面的 image 欄位替換成剛剛做好的動態 ECR 網址
+        sed -i "s|image: .*|image: ${{ env.FULL_IMAGE_NAME }}|g" kubernetes/deployment.yaml
+        
+        # 執行部署
+        kubectl apply -f kubernetes/deployment.yaml
+        kubectl apply -f kubernetes/service.yaml
