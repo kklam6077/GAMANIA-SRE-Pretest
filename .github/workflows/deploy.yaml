@@ -1,173 +1,161 @@
 name: Gamania SRE Pretest CI/CD Pipeline
 
-
-
-# Trigger：Monitoring Pull Request
-
+# Trigger: 當 PR 被 merge 進 main branch 時執行
+# 使用 pull_request closed 事件搭配 merged 條件，
+# 確保只有真正 merge 的 PR 才觸發，rejected/closed PR 不會觸發
 on:
-
   pull_request:
-
     branches:
-
       - main
-
     types:
+      - closed
 
-      - closed 
-
-
-
-jobs:
-
-  build-and-deploy:
-
-    # Start the automation while PR merged success 
-
-    if: github.event.pull_request.merged == true
-
-    
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - name: Checkout Source Code
-
-        uses: actions/checkout@v4
-
-
-
-# ⚙️ 設定 AWS 相關的環境變數，讓整份腳本可以共用
-
+# 全域環境變數，讓所有 step 共用，避免硬編碼散落各處
 env:
-
-  AWS_REGION: ap-southeast-1                                           # 新加坡區域
-
-  ECR_REPOSITORY: gamania-nginx                                         # 你的 ECR 倉庫名稱
-
-  EKS_CLUSTER_NAME: gamania-sre-cluster                                 # 你的 EKS 叢集名稱
-
-  HELM_RELEASE_NAME: gamania-web                                        # Helm 的 Release 命名
-
-
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: gamania-nginx
+  EKS_CLUSTER_NAME: gamania-sre-cluster
+  HELM_RELEASE_NAME: gamania-web
+  TF_WORKING_DIR: ./terraform
 
 jobs:
-
-  build-and-deploy:
-
+  # ────────────────────────────────────────────────────────────
+  # Job 1: Terraform
+  # 負責基礎設施的佈建與更新（VPC、EKS）
+  # 與應用程式部署分開成獨立 job，原因：
+  #   1. infra 變動頻率遠低於應用程式
+  #   2. terraform plan 需要人工 review 才 apply，風險控制更嚴謹
+  #   3. infra job 失敗不應該阻止已存在 cluster 上的應用程式更新
+  # ────────────────────────────────────────────────────────────
+  terraform:
+    name: Provision Infrastructure
     runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
 
     steps:
-
-      
-
-      # 📥 步驟 1：下載專案代碼
-
-      # 將 GitHub 倉庫裡的代碼拉取到 CI 機器人本地，以便讀取 Dockerfile 與 Helm Chart
-
-      - name: Checkout Source Code
-
+      # Step 1: Checkout
+      - name: Checkout source code
         uses: actions/checkout@v4
 
-
-
-      # 🔑 步驟 2：登入 AWS 權限認證
-
-      # 透過 GitHub Secrets 帶入憑證，讓機器人獲得操作 AWS 資源的最高權限
-
-      - name: Configure AWS Credentials
-
+      # Step 2: AWS authentication
+      # 透過 GitHub Secrets 注入 IAM 憑證
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
-
         with:
-
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
           aws-region: ${{ env.AWS_REGION }}
 
+      # Step 3: Install Terraform
+      # 使用官方 HashiCorp action，自動處理版本管理與快取
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.0"
 
+      # Step 4: Terraform Init
+      # 使用 Partial Configuration 注入 S3 backend 設定
+      # backend 參數不寫在 .tf 檔案裡，由 CI/CD 注入以支援多環境
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=sre-pretest/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
 
-      # 🔓 步驟 3：登入 AWS ECR 鏡像庫
+      # Step 5: Terraform Plan
+      # 預覽即將發生的變更，輸出結果會顯示在 GitHub Actions log 供人工確認
+      # -out 將 plan 結果存檔，確保後續 apply 執行的是同一份 plan
+      - name: Terraform plan
+        run: |
+          terraform plan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}" \
+            -var="vpc_cidr=${{ secrets.TF_VPC_CIDR }}" \
+            -out=tfplan
 
-      # 取得 Docker 登入權杖，這樣等一下才能順利把貨箱（Image）推上 AWS 倉庫
+      # Step 6: Terraform Apply
+      # 套用 plan 結果，自動確認不需人工輸入 yes
+      # 只 apply 先前 plan 產生的 tfplan，不會有額外的變更
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
 
+  # ────────────────────────────────────────────────────────────
+  # Job 2: Build and Deploy
+  # 負責 Docker image build、推送 ECR、Helm 部署
+  # needs: terraform 確保 infra 就緒後才執行
+  # ────────────────────────────────────────────────────────────
+  build-and-deploy:
+    name: Build and Deploy Application
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      # Step 1: Checkout
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # Step 2: AWS authentication
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: ECR login
+      # 取得 ECR 的臨時 Docker login token（有效期 12 小時）
       - name: Login to Amazon ECR
-
         id: login-ecr
-
         uses: aws-actions/amazon-ecr-login@v2
 
-
-
-      # 🏷️ 步驟 4：動態撈取 Git Commit SHA 作為唯一 Tag（解決最新版 latest 覆蓋漏洞）
-
-      # 這行會截取 Git 的前七碼雜湊值（例如 78b6466f），作為這尊貨櫃的專屬身份證
-
-      - name: Get Git Short SHA
-
+      # Step 4: Generate image tag from Git commit SHA
+      # 使用 Git short SHA（7碼）作為 image tag，而非 latest
+      # 每個 commit 對應唯一的 image，部署可追溯，出問題時可快速 rollback
+      - name: Get Git short SHA
         id: vars
-
         run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-
-
-      # 🐳 步驟 5：Docker 打包並推上雲端倉庫
-
-      # 實作 Topic 2 的打包邏輯，用動態的 Git SHA 作為 Tag，確保版本可追溯（Traceability）
-
-      - name: Build, Tag, and Push Docker Image
-
+      # Step 5: Build and push Docker image
+      # 對應 Topic 2 的 Dockerfile，build 完後以 SHA tag 推送至 ECR
+      - name: Build, tag, and push Docker image to ECR
         env:
-
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
-
         run: |
-
           cd app
-
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-
-
-      # ☸️ 步驟 6：設定 Kubernetes 控制環境 (kubectl & Helm)
-
-      # 在 Linux 機器人身上安裝與配置 EKS 控制大腦所需的工具
-
-      - name: Setup Setup Helm & Kubectl
-
+      # Step 6: Install tools and configure kubectl
+      # 安裝 Helm 並透過 aws cli 更新 kubeconfig，讓後續 step 可操作 EKS cluster
+      - name: Setup Helm and configure kubectl
         run: |
-
           sudo snap install helm --classic
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
 
-          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
-
-
-
-      # 🛸 步驟 7：使用 Helm 進行一鍵滾動更新 (Rolling Update)
-
-      # 實作 Topic 3 的動態部署。核心利用 --set 強行把當前的 Git SHA 灌進 values.yaml，
-
-      # 這樣 K8s 就會看到新 Tag，進而發動零停機（Zero-downtime）的完美滾動更新！
-
-      - name: Deploy to Amazon EKS via Helm
-
+      # Step 7: Deploy to EKS via Helm
+      # upgrade --install：首次執行是 install，後續是 upgrade（idempotent）
+      # --set image.tag 將 SHA 注入 values，K8s 偵測到 tag 變更後觸發 rolling update
+      - name: Deploy to EKS via Helm
         env:
-
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
-
         run: |
-
           helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./charts/gamania-app \
-
             --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
-
             --set image.tag=$IMAGE_TAG
+
+      # Step 8: Verify deployment
+      # 等待 rolling update 完成，確認所有 pod 都成功啟動
+      # 若 pod 起不來（如 image pull error、crash loop），此 step 會失敗，
+      # pipeline 標記為 failed，避免誤以為部署成功
+      - name: Verify deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} \
+            --timeout=120s
