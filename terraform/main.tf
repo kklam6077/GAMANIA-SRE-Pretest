@@ -1,52 +1,33 @@
+# ===================================================================
+# locals 區隔 : 把var 改local, 方便模組統一引用
+# ===================================================================
+
 locals {
-  cluster_name = "gamania-sre-cluster"
-  region       = "ap-southeast-1"
+  cluster_name = var.cluster_name
+  region       = var.aws_region
+  vpc_cidr     = var.vpc_cidr
 }
 
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+# ================================================================================
+# 用S3 Bucket 來存放 Terraform Remote State 檔案 避免存放Serive ID等重要數據在本地
+# 加上 Prevent Destroy 來避免terraform destory Delete Bucket
+# ================================================================================
 
-  name = "gamania-sre-vpc"
-  cidr = "10.0.0.0/16"
-
-  azs             = ["${local.region}a", "${local.region}c", "${local.region}b"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
-
-  enable_nat_gateway = true
-  single_nat_gateway = true 
-
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = "1"
-  }
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = "1"
+resource "aws_s3_bucket" "terraform_state" {
+  bucket        = "gamania-sre-tfstate-694322569347"
+  
+  lifecycle {
+    prevent_destroy = true
   }
 }
 
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.0"
+# =================================================================
+# 加上S3 Verion Control, 確保tfstate 可以回滾至前一版本
+# =================================================================
 
-  cluster_name    = local.cluster_name
-  cluster_version = "1.30"
-
-  cluster_endpoint_public_access = true
-
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets 
-
-  enable_cluster_creator_admin_permissions = true
-
-  eks_managed_node_groups = {
-    general = {
-      desired_size = 2
-      min_size     = 1
-      max_size     = 3
-
-      instance_types = ["t3.small"] 
-      capacity_type  = "ON_DEMAND"
-    }
+resource "aws_s3_bucket_versioning" "state_versioning" {
+  bucket = aws_s3_bucket.terraform_state.id
+  versioning_configuration {
+    status = "Enabled"
   }
 }

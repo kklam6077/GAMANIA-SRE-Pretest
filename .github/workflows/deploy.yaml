@@ -1,50 +1,173 @@
-name: Production CD - Deploy to Amazon EKS
+name: Gamania SRE Pretest CI/CD Pipeline
 
-# 🎯 實現你的設計：只有當代碼正式「合併/推入」到 main 主幹時，才觸發部署
+
+
+# Trigger：Monitoring Pull Request
+
 on:
-  push:
-    branches: [ "main" ]
+
+  pull_request:
+
+    branches:
+
+      - main
+
+    types:
+
+      - closed 
+
+
 
 jobs:
-  deploy-to-prd:
-    runs-on: ubuntu-latest
+
+  build-and-deploy:
+
+    # Start the automation while PR merged success 
+
+    if: github.event.pull_request.merged == true
+
     
+
+    runs-on: ubuntu-latest
+
     steps:
-    - name: 1. 拉取最新的原始碼
-      uses: actions/checkout@v4
 
-    - name: 2. 設定 AWS 鑰匙（調用你剛才設定的 Secrets）
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ap-southeast-1
+      - name: Checkout Source Code
 
-    - name: 3. 登入 AWS ECR 倉庫
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+        uses: actions/checkout@v4
 
-    - name: 4. 編編並推送 Docker 映像檔 (引入動態 Commit SHA 標籤)
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: gamania-nginx
-        # 💡 SRE 最佳實踐：不用固定的 :v1，改用 GitHub 獨一無二的 Commit ID 當標籤，防止版本覆蓋
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        # 把動態產生的完整映像檔網址存進環境變數，方便下一步使用
-        echo "FULL_IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
 
-    - name: 5. 更新本地的 Kubeconfig 憑證以連接 EKS
-      run: |
-        aws eks update-kubeconfig --name gamania-sre-cluster --region ap-southeast-1
 
-    - name: 6. 動態修改 K8s 藍圖並發射部署 (CD)
-      run: |
-        # 💡 SRE 祕技：用 sed 指令，自動把 deployment.yaml 裡面的 image 欄位替換成剛剛做好的動態 ECR 網址
-        sed -i "s|image: .*|image: ${{ env.FULL_IMAGE_NAME }}|g" kubernetes/deployment.yaml
-        
-        # 執行部署
-        kubectl apply -f kubernetes/deployment.yaml
-        kubectl apply -f kubernetes/service.yaml
+# ⚙️ 設定 AWS 相關的環境變數，讓整份腳本可以共用
+
+env:
+
+  AWS_REGION: ap-southeast-1                                           # 新加坡區域
+
+  ECR_REPOSITORY: gamania-nginx                                         # 你的 ECR 倉庫名稱
+
+  EKS_CLUSTER_NAME: gamania-sre-cluster                                 # 你的 EKS 叢集名稱
+
+  HELM_RELEASE_NAME: gamania-web                                        # Helm 的 Release 命名
+
+
+
+jobs:
+
+  build-and-deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      
+
+      # 📥 步驟 1：下載專案代碼
+
+      # 將 GitHub 倉庫裡的代碼拉取到 CI 機器人本地，以便讀取 Dockerfile 與 Helm Chart
+
+      - name: Checkout Source Code
+
+        uses: actions/checkout@v4
+
+
+
+      # 🔑 步驟 2：登入 AWS 權限認證
+
+      # 透過 GitHub Secrets 帶入憑證，讓機器人獲得操作 AWS 資源的最高權限
+
+      - name: Configure AWS Credentials
+
+        uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+          aws-region: ${{ env.AWS_REGION }}
+
+
+
+      # 🔓 步驟 3：登入 AWS ECR 鏡像庫
+
+      # 取得 Docker 登入權杖，這樣等一下才能順利把貨箱（Image）推上 AWS 倉庫
+
+      - name: Login to Amazon ECR
+
+        id: login-ecr
+
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+
+      # 🏷️ 步驟 4：動態撈取 Git Commit SHA 作為唯一 Tag（解決最新版 latest 覆蓋漏洞）
+
+      # 這行會截取 Git 的前七碼雜湊值（例如 78b6466f），作為這尊貨櫃的專屬身份證
+
+      - name: Get Git Short SHA
+
+        id: vars
+
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+
+
+      # 🐳 步驟 5：Docker 打包並推上雲端倉庫
+
+      # 實作 Topic 2 的打包邏輯，用動態的 Git SHA 作為 Tag，確保版本可追溯（Traceability）
+
+      - name: Build, Tag, and Push Docker Image
+
+        env:
+
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+
+        run: |
+
+          cd app
+
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+
+
+      # ☸️ 步驟 6：設定 Kubernetes 控制環境 (kubectl & Helm)
+
+      # 在 Linux 機器人身上安裝與配置 EKS 控制大腦所需的工具
+
+      - name: Setup Setup Helm & Kubectl
+
+        run: |
+
+          sudo snap install helm --classic
+
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+
+
+      # 🛸 步驟 7：使用 Helm 進行一鍵滾動更新 (Rolling Update)
+
+      # 實作 Topic 3 的動態部署。核心利用 --set 強行把當前的 Git SHA 灌進 values.yaml，
+
+      # 這樣 K8s 就會看到新 Tag，進而發動零停機（Zero-downtime）的完美滾動更新！
+
+      - name: Deploy to Amazon EKS via Helm
+
+        env:
+
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+
+        run: |
+
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./charts/gamania-app \
+
+            --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
+
+            --set image.tag=$IMAGE_TAG

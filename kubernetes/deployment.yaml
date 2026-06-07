@@ -15,8 +15,8 @@ spec:
         app: gamania-nginx
     spec:
       containers:
-        - name: nginx-container
+        - name: gamania-app
           image: 694322569347.dkr.ecr.ap-southeast-1.amazonaws.com/gamania-nginx:v1 
           imagePullPolicy: Always
           ports:
-            - containerPort: 80 
+            - containerPort: 8080
