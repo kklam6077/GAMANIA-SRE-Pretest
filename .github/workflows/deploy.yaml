@@ -143,5 +143,14 @@ jobs:
       # 若 pod 起不來（image pull error、crashloop），pipeline 標記為 failed
       - name: Verify deployment rollout
         run: |
-          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} \
-            --timeout=120s
+          DEPLOY=$(kubectl get deployment \
+            -l app.kubernetes.io/instance=${{ env.HELM_RELEASE_NAME }} \
+            -o jsonpath='{.items[0].metadata.name}')
+      
+          if [ -z "$DEPLOY" ]; then
+            echo "ERROR: No deployment found for release ${{ env.HELM_RELEASE_NAME }}"
+            exit 1
+          fi
+      
+          echo "Waiting for deployment: $DEPLOY"
+          kubectl rollout status deployment/"$DEPLOY" --timeout=120s
