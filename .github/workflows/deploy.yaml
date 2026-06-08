@@ -14,7 +14,7 @@ env:
   ECR_REPOSITORY: gamania-nginx
   EKS_CLUSTER_NAME: gamania-sre-cluster
   HELM_RELEASE_NAME: gamania-web
-  TF_WORKING_DIR: ./terraform
+  TF_WORKING_DIR: ./topic1_terraform
 
 jobs:
   # ────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
         run: |
-          cd app
+          cd topic2_docker
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -134,7 +134,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
         run: |
-          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./charts/gamania-app \
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./topic3_helm_kubernetes/gamania-app \
             --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
             --set image.tag=$IMAGE_TAG
 
