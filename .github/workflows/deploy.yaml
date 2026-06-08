@@ -1,7 +1,6 @@
 name: Gamania SRE Pretest CI/CD Pipeline
 
 # Trigger: 當 PR 被 merge 進 main branch 時執行
-# 使用 pull_request closed 事件搭配 merged 條件，
 # 確保只有真正 merge 的 PR 才觸發，rejected/closed PR 不會觸發
 on:
   pull_request:
@@ -10,7 +9,6 @@ on:
     types:
       - closed
 
-# 全域環境變數，讓所有 step 共用，避免硬編碼散落各處
 env:
   AWS_REGION: ap-southeast-1
   ECR_REPOSITORY: gamania-nginx
@@ -21,11 +19,7 @@ env:
 jobs:
   # ────────────────────────────────────────────────────────────
   # Job 1: Terraform
-  # 負責基礎設施的佈建與更新（VPC、EKS）
-  # 與應用程式部署分開成獨立 job，原因：
-  #   1. infra 變動頻率遠低於應用程式
-  #   2. terraform plan 需要人工 review 才 apply，風險控制更嚴謹
-  #   3. infra job 失敗不應該阻止已存在 cluster 上的應用程式更新
+  # 與應用程式部署分開成獨立 job
   # ────────────────────────────────────────────────────────────
   terraform:
     name: Provision Infrastructure
@@ -36,12 +30,10 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
 
     steps:
-      # Step 1: Checkout
       - name: Checkout source code
         uses: actions/checkout@v4
 
       # Step 2: AWS authentication
-      # 透過 GitHub Secrets 注入 IAM 憑證
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -50,7 +42,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # Step 3: Install Terraform
-      # 使用官方 HashiCorp action，自動處理版本管理與快取
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -58,7 +49,6 @@ jobs:
 
       # Step 4: Terraform Init
       # 使用 Partial Configuration 注入 S3 backend 設定
-      # backend 參數不寫在 .tf 檔案裡，由 CI/CD 注入以支援多環境
       - name: Terraform init
         run: |
           terraform init \
@@ -67,8 +57,8 @@ jobs:
             -backend-config="region=${{ env.AWS_REGION }}"
 
       # Step 5: Terraform Plan
-      # 預覽即將發生的變更，輸出結果會顯示在 GitHub Actions log 供人工確認
-      # -out 將 plan 結果存檔，確保後續 apply 執行的是同一份 plan
+      # 將結果顯示在 GitHub Actions log 人工確認
+      # 將 plan 結果存檔，確保後續 apply 執行的是同一份 plan
       - name: Terraform plan
         run: |
           terraform plan \
@@ -78,15 +68,14 @@ jobs:
             -out=tfplan
 
       # Step 6: Terraform Apply
-      # 套用 plan 結果，自動確認不需人工輸入 yes
+      # 套用 plan 結果，自動確認不需人工輸入
       # 只 apply 先前 plan 產生的 tfplan，不會有額外的變更
       - name: Terraform apply
         run: terraform apply -auto-approve tfplan
 
   # ────────────────────────────────────────────────────────────
-  # Job 2: Build and Deploy
+  # Job 2: Build and Deploy Application
   # 負責 Docker image build、推送 ECR、Helm 部署
-  # needs: terraform 確保 infra 就緒後才執行
   # ────────────────────────────────────────────────────────────
   build-and-deploy:
     name: Build and Deploy Application
@@ -107,20 +96,19 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # Step 3: ECR login
-      # 取得 ECR 的臨時 Docker login token（有效期 12 小時）
+      # 取得 ECR 的臨時 Docker login token
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       # Step 4: Generate image tag from Git commit SHA
-      # 使用 Git short SHA（7碼）作為 image tag，而非 latest
-      # 每個 commit 對應唯一的 image，部署可追溯，出問題時可快速 rollback
+      # 使用 Git short SHA 作為 image tag，而非 latest，出問題時可快速 rollback
       - name: Get Git short SHA
         id: vars
         run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       # Step 5: Build and push Docker image
-      # 對應 Topic 2 的 Dockerfile，build 完後以 SHA tag 推送至 ECR
+      # build 之後 用SHA tag 推送至 ECR
       - name: Build, tag, and push Docker image to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -131,7 +119,7 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
       # Step 6: Install tools and configure kubectl
-      # 安裝 Helm 並透過 aws cli 更新 kubeconfig，讓後續 step 可操作 EKS cluster
+      # 安裝 Helm 並透過 aws cli 更新 kubeconfig，
       - name: Setup Helm and configure kubectl
         run: |
           sudo snap install helm --classic
@@ -140,7 +128,6 @@ jobs:
             --name ${{ env.EKS_CLUSTER_NAME }}
 
       # Step 7: Deploy to EKS via Helm
-      # upgrade --install：首次執行是 install，後續是 upgrade（idempotent）
       # --set image.tag 將 SHA 注入 values，K8s 偵測到 tag 變更後觸發 rolling update
       - name: Deploy to EKS via Helm
         env:
@@ -153,8 +140,7 @@ jobs:
 
       # Step 8: Verify deployment
       # 等待 rolling update 完成，確認所有 pod 都成功啟動
-      # 若 pod 起不來（如 image pull error、crash loop），此 step 會失敗，
-      # pipeline 標記為 failed，避免誤以為部署成功
+      # 若 pod 起不來（image pull error、crashloop），pipeline 標記為 failed
       - name: Verify deployment rollout
         run: |
           kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} \
