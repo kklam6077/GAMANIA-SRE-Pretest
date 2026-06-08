@@ -72,7 +72,7 @@ docker push \
 
 ---
 
-## Step 2A — Deploy via Helm (recommended)
+## Step 2 — Deploy via Helm
 
 ```bash
 # Lint the chart first (catch template errors before deploying)
@@ -99,18 +99,6 @@ helm upgrade gamania-app charts/gamania-app \
   --set image.tag=v1 \
   --set replicaCount=3
 ```
-
----
-
-## Step 2B — Deploy via Plain Manifest (alternative)
-
-```bash
-kubectl apply -f kubernetes/deployment.yaml
-kubectl apply -f kubernetes/service.yaml
-```
-
-> Note: the plain manifest version does not include liveness/readiness probes, resource limits, or HPA. Use the Helm chart for production-grade deployments.
-
 ---
 
 ## Step 3 — Verify Deployment
