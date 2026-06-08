@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gamania-app.fullname" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: gamania-app
+  template:
+    metadata:
+      labels:
+        app: gamania-app
+    spec:
+      containers:
+        - name: web-service
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          
+          # 確保pod 是否活著, 失敗時重啟 container
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.service.targetPort }}
+          
+          #確認pod 是否可用,確認/sre.txt 可以訪問
+          readinessProbe:
+            httpGet:
+              path: /sre.txt
+              port: {{ .Values.service.targetPort }}
+
+          # 確保結構正確
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

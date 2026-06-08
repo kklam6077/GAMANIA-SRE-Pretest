@@ -1,50 +1,147 @@
-name: Production CD - Deploy to Amazon EKS
+name: Gamania SRE Pretest CI/CD Pipeline
 
-# 🎯 實現你的設計：只有當代碼正式「合併/推入」到 main 主幹時，才觸發部署
+# Trigger: 當 PR 被 merge 進 main branch 時執行
+# 確保只有真正 merge 的 PR 才觸發，rejected/closed PR 不會觸發
 on:
-  push:
-    branches: [ "main" ]
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: gamania-nginx
+  EKS_CLUSTER_NAME: gamania-sre-cluster
+  HELM_RELEASE_NAME: gamania-web
+  TF_WORKING_DIR: ./topic1_terraform
 
 jobs:
-  deploy-to-prd:
+  # ────────────────────────────────────────────────────────────
+  # Job 1: Terraform
+  # 與應用程式部署分開成獨立 job
+  # ────────────────────────────────────────────────────────────
+  terraform:
+    name: Provision Infrastructure
     runs-on: ubuntu-latest
-    
+    if: github.event.pull_request.merged == true
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
     steps:
-    - name: 1. 拉取最新的原始碼
-      uses: actions/checkout@v4
+      - name: Checkout source code
+        uses: actions/checkout@v4
 
-    - name: 2. 設定 AWS 鑰匙（調用你剛才設定的 Secrets）
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ap-southeast-1
+      # Step 2: AWS authentication
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: 3. 登入 AWS ECR 倉庫
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+      # Step 3: Install Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.0"
 
-    - name: 4. 編編並推送 Docker 映像檔 (引入動態 Commit SHA 標籤)
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: gamania-nginx
-        # 💡 SRE 最佳實踐：不用固定的 :v1，改用 GitHub 獨一無二的 Commit ID 當標籤，防止版本覆蓋
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        # 把動態產生的完整映像檔網址存進環境變數，方便下一步使用
-        echo "FULL_IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+      # Step 4: Terraform Init
+      # 使用 Partial Configuration 注入 S3 backend 設定
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=sre-pretest/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
 
-    - name: 5. 更新本地的 Kubeconfig 憑證以連接 EKS
-      run: |
-        aws eks update-kubeconfig --name gamania-sre-cluster --region ap-southeast-1
+      # Step 5: Terraform Plan
+      # 將結果顯示在 GitHub Actions log 人工確認
+      # 將 plan 結果存檔，確保後續 apply 執行的是同一份 plan
+      - name: Terraform plan
+        run: |
+          terraform plan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}" \
+            -var="vpc_cidr=${{ secrets.TF_VPC_CIDR }}" \
+            -out=tfplan
 
-    - name: 6. 動態修改 K8s 藍圖並發射部署 (CD)
-      run: |
-        # 💡 SRE 祕技：用 sed 指令，自動把 deployment.yaml 裡面的 image 欄位替換成剛剛做好的動態 ECR 網址
-        sed -i "s|image: .*|image: ${{ env.FULL_IMAGE_NAME }}|g" kubernetes/deployment.yaml
-        
-        # 執行部署
-        kubectl apply -f kubernetes/deployment.yaml
-        kubectl apply -f kubernetes/service.yaml
+      # Step 6: Terraform Apply
+      # 套用 plan 結果，自動確認不需人工輸入
+      # 只 apply 先前 plan 產生的 tfplan，不會有額外的變更
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+  # ────────────────────────────────────────────────────────────
+  # Job 2: Build and Deploy Application
+  # 負責 Docker image build、推送 ECR、Helm 部署
+  # ────────────────────────────────────────────────────────────
+  build-and-deploy:
+    name: Build and Deploy Application
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      # Step 1: Checkout
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # Step 2: AWS authentication
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: ECR login
+      # 取得 ECR 的臨時 Docker login token
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Step 4: Generate image tag from Git commit SHA
+      # 使用 Git short SHA 作為 image tag，而非 latest，出問題時可快速 rollback
+      - name: Get Git short SHA
+        id: vars
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # Step 5: Build and push Docker image
+      # build 之後 用SHA tag 推送至 ECR
+      - name: Build, tag, and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        run: |
+          cd topic2_docker
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # Step 6: Install tools and configure kubectl
+      # 安裝 Helm 並透過 aws cli 更新 kubeconfig，
+      - name: Setup Helm and configure kubectl
+        run: |
+          sudo snap install helm --classic
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      # Step 7: Deploy to EKS via Helm
+      # --set image.tag 將 SHA 注入 values，K8s 偵測到 tag 變更後觸發 rolling update
+      - name: Deploy to EKS via Helm
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.IMAGE_TAG }}
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./topic3_helm_kubernetes/gamania-app \
+            --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
+            --set image.tag=$IMAGE_TAG
+
+      # Step 8: Verify deployment
+      # 等待 rolling update 完成，確認所有 pod 都成功啟動
+      # 若 pod 起不來（image pull error、crashloop），pipeline 標記為 failed
+      - name: Verify deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} \
+            --timeout=120s
