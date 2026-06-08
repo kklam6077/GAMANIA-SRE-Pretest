@@ -1,4 +1,4 @@
-# Gamania SRE Pretest — KK Lam
+# Gamania SRE Pretest — Lam Kin Kwan 林建均
 
 This repository contains my submission for the Gamania SRE Pretest, covering infrastructure provisioning, containerization, Kubernetes deployment, and CI/CD pipeline design.
 
