@@ -59,7 +59,7 @@ This project uses **Partial Configuration** for the S3 backend. The `backend "s3
 terraform init \
   -backend-config="bucket=gamania-sre-tfstate-694322569347" \
   -backend-config="key=sre-pretest/terraform.tfstate" \
-  -backend-config="region=ap-northeast-1"
+  -backend-config="region=ap-southeast-1"
 ```
 
 This pattern allows the same Terraform code to be reused across multiple environments (dev / staging / prod) by switching the backend config, without modifying any `.tf` files.
