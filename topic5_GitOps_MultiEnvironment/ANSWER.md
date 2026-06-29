@@ -1,8 +1,6 @@
 # Topic 5 — GitOps 多環境部署
 
-## 什麼是 GitOps？
-
-GitOps 是一種以 Git 作為**唯一真實來源（Single Source of Truth）**的實踐方式，所有對系統的變更都必須透過 Git commit 和 Pull Request 進行，這帶來三個核心好處：
+GitOps 以 Git 作為**唯一真實來源（Single Source of Truth）**的實踐方式，所有對系統的變更都必須透過 Git commit 和 Pull Request 進行，這帶來三個核心好處：
 
 - **可審計（Auditable）**：所有變更都有記錄，清楚知道誰在什麼時間改了什麼
 - **可回滾（Reversible）**：revert 一個 commit 就等於回滾一次部署
